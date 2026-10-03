@@ -211,7 +211,7 @@ multi-CI ingestion — each only when V1–V3 data proves it earns its place.
 ## Development
 
 ```bash
-cargo test          # 32 tests: unit + fixture integration + bisect integration
+cargo test          # 41 tests: unit + fixture integration + bisect integration
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

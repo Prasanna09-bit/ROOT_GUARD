@@ -1,7 +1,41 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::LazyLock;
 
 use super::Commit;
+
+/// `<sha> is the first '<term>' commit` — the line `git bisect` prints once it
+/// has narrowed to a single commit.
+///
+/// git ≤ 2.54 emits it unquoted (`bisect.c:1116` prints
+/// `"%s is the first %s commit\n"`); git ≥ 2.55 quotes the term so translators
+/// may reorder it (`"%s is the first '%s' commit\n"`). The `printf` is *not*
+/// wrapped in `_()`, so the surrounding words are byte-identical in every
+/// locale — only the quotes differ. The term itself is renameable with
+/// `--term-bad` (`bad`, `new`, …), so match any run of non-quote characters
+/// instead of the literal `bad`.
+///
+/// Anchored at column 0 because `show_commit()` prints the winning commit's
+/// subject indented — otherwise a commit message could echo this text back and
+/// win the match. Only full object IDs are accepted (40 hex for SHA-1, 64 for
+/// SHA-256): `oid_to_hex()` never abbreviates, and full length keeps words like
+/// `deadbee` from being mistaken for a SHA.
+static FIRST_BAD_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?m)^([0-9a-fA-F]{64}|[0-9a-fA-F]{40}) is the first '?[^'\r\n]+?'? commit[ \t]*\r?$",
+    )
+    .expect("FIRST_BAD_LINE is a valid regex")
+});
+
+/// `# first '<term>' commit: [<sha>] <subject>` — the same fact recorded in
+/// `$GIT_DIR/BISECT_LOG` by a literal (non-`_()`) format string
+/// (`builtin/bisect.c:762`), so it survives locale and quoting changes alike.
+/// Appended only once the first bad commit is known, which makes it a safe
+/// fallback even when `git bisect run` exits non-zero.
+static FIRST_BAD_LOG_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^# first '?[^'\r\n]+?'? commit: \[([0-9a-fA-F]{64}|[0-9a-fA-F]{40})\]")
+        .expect("FIRST_BAD_LOG_LINE is a valid regex")
+});
 
 #[derive(Debug, Clone)]
 pub struct BisectResult {
@@ -114,12 +148,13 @@ pub fn run(
 
     match run {
         Ok(out) => {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            for l in combined.lines() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+
+            // Walk each stream on its own: concatenating stdout and stderr
+            // without a separator can glue the last stdout line onto the first
+            // stderr line, hiding both from every parser below.
+            for l in stdout.lines().chain(stderr.lines()) {
                 log.push(l.to_string());
                 // Each tested revision prints the command being run, then a
                 // `Bisecting: …` line for the *next* selection.
@@ -130,13 +165,19 @@ pub fn run(
                     skipped += 1;
                 }
             }
-            // Success output ends with `<sha> is the first bad commit`.
-            if let Some(line) = combined
-                .lines()
-                .find(|l| l.ends_with("is the first bad commit"))
-            {
-                let sha = line.split_whitespace().next().unwrap_or("").to_string();
-                culprit = commit_detail(root, &sha);
+            // Success output ends with `<sha> is the first '<term>' commit`
+            // (unquoted before git 2.55). If that line is unreadable, fall
+            // back to the structured metadata git keeps for itself.
+            let mut sha =
+                parse_first_bad_commit(&stdout).or_else(|| parse_first_bad_commit(&stderr));
+            if sha.is_none() {
+                sha = structured_first_bad(root, out.status.success());
+            }
+            if let Some(sha) = sha {
+                match commit_detail(root, &sha) {
+                    Some(c) => culprit = Some(c),
+                    None => log.push(format!("first bad commit {sha} could not be resolved")),
+                }
             } else if out.status.success() {
                 log.push("bisect finished but no first-bad-commit line found".into());
             } else {
@@ -174,6 +215,59 @@ pub fn run(
         auto_good: auto_good.or_else(|| good.map(|s| s.to_string())),
         auto_bad,
     })
+}
+
+/// Pull the first-bad SHA out of `git bisect run` output.
+///
+/// Accepts both the quoted (git ≥ 2.55) and unquoted (≤ 2.54) forms, any
+/// `--term-bad` vocabulary, trailing whitespace and CRLF line endings.
+/// Returns `None` when nothing matches — callers must treat that as "keep
+/// looking", never as an empty SHA.
+fn parse_first_bad_commit(output: &str) -> Option<String> {
+    let sha = FIRST_BAD_LINE.captures(output)?.get(1)?.as_str();
+    is_full_oid(sha).then(|| sha.to_string())
+}
+
+/// Structured fallbacks for the first-bad commit, used when the human-readable
+/// line can't be parsed (format drift, unexpected locale, glued streams).
+///
+/// 1. `$GIT_DIR/BISECT_LOG` — `# first '<term>' commit: [<sha>] <subject>`,
+///    written only once the answer is known.
+/// 2. `refs/bisect/bad` — advanced to the first bad commit when `git bisect run`
+///    succeeds. While a session is still open it merely holds the *current*
+///    candidate, so it is trusted only on a zero exit status.
+fn structured_first_bad(root: &Path, run_succeeded: bool) -> Option<String> {
+    if let Some(sha) = first_bad_from_bisect_log(root) {
+        return Some(sha);
+    }
+    if !run_succeeded {
+        return None;
+    }
+    let raw = capture(
+        root,
+        &["rev-parse", "--verify", "--quiet", "refs/bisect/bad"],
+    )
+    .ok()?;
+    let sha = raw.trim();
+    is_full_oid(sha).then(|| sha.to_string())
+}
+
+/// Read `# first '<term>' commit: [<sha>]` out of `$GIT_DIR/BISECT_LOG`.
+fn first_bad_from_bisect_log(root: &Path) -> Option<String> {
+    let path = capture(root, &["rev-parse", "--git-path", "BISECT_LOG"]).ok()?;
+    let text = std::fs::read_to_string(root.join(path.trim())).ok()?;
+    first_bad_from_log(&text)
+}
+
+/// Same extraction, against an already-read `BISECT_LOG` body.
+fn first_bad_from_log(text: &str) -> Option<String> {
+    let sha = FIRST_BAD_LOG_LINE.captures(text)?.get(1)?.as_str();
+    is_full_oid(sha).then(|| sha.to_string())
+}
+
+/// A complete object ID: 40 hex chars for SHA-1, 64 for SHA-256.
+fn is_full_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn ensure_repo(root: &Path) -> anyhow::Result<()> {
@@ -337,4 +431,137 @@ fn capture(root: &Path, args: &[&str]) -> anyhow::Result<String> {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_bad_from_log, is_full_oid, parse_first_bad_commit};
+
+    const SHA: &str = "7ca4e2bc068b86cc4b741933f77d0adf421e7863";
+    const SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    /// Realistic `git bisect run` stdout: probe noise, the winning line, then
+    /// `show_commit()` output whose *indented* subject echoes the same words.
+    fn stdout_block(first_bad_line: &str) -> String {
+        let picked = format!("[{SHA}] commit 6");
+        let subject = format!("    Subject echoing: {first_bad_line}");
+        let shown = format!("commit {SHA}");
+        [
+            "running 'sh' '-c' 'test'",
+            "Bisecting: 1 revision left to test after this (roughly 1 step)",
+            picked.as_str(),
+            "running 'sh' '-c' 'test'",
+            first_bad_line,
+            shown.as_str(),
+            "    Author: t <t@t.io>",
+            subject.as_str(),
+            "bisect found first bad commit",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn parses_unquoted_output_from_git_up_to_2_54() {
+        let out = stdout_block(&format!("{SHA} is the first bad commit"));
+        assert_eq!(parse_first_bad_commit(&out).as_deref(), Some(SHA));
+    }
+
+    #[test]
+    fn parses_quoted_output_from_git_2_55_onwards() {
+        let out = stdout_block(&format!("{SHA} is the first 'bad' commit"));
+        assert_eq!(parse_first_bad_commit(&out).as_deref(), Some(SHA));
+    }
+
+    #[test]
+    fn parses_final_line_without_trailing_newline() {
+        let out = format!("{SHA} is the first 'bad' commit");
+        assert_eq!(parse_first_bad_commit(&out).as_deref(), Some(SHA));
+    }
+
+    #[test]
+    fn tolerates_crlf_line_endings() {
+        let out = format!(
+            "running 'sh' '-c' 'test'\r\n{SHA} is the first 'bad' commit\r\ncommit {SHA}\r\n"
+        );
+        assert_eq!(parse_first_bad_commit(&out).as_deref(), Some(SHA));
+    }
+
+    #[test]
+    fn matches_any_term_bad_new_or_renamed() {
+        for line in [
+            format!("{SHA} is the first new commit"),
+            format!("{SHA} is the first 'new' commit"),
+            format!("{SHA} is the first bad commit"),
+            format!("{SHA} is the first 'bad' commit"),
+        ] {
+            assert_eq!(
+                parse_first_bad_commit(&line).as_deref(),
+                Some(SHA),
+                "line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_red_herring_lines() {
+        let partial = &SHA[..39];
+        for line in [
+            String::new(),
+            "bisect found first bad commit".to_string(),
+            "bisect found first 'bad' commit".to_string(),
+            format!("commit {SHA}"),
+            // show_commit()'s indented subject — a commit message could echo
+            // the exact winning words back at us.
+            format!("    {SHA} is the first bad commit"),
+            format!("# possible first 'bad' commit: [{SHA}] older commit"),
+            format!("{partial} is the first bad commit"),
+            "deadbee is the first bad commit".to_string(),
+        ] {
+            assert!(
+                parse_first_bad_commit(&line).is_none(),
+                "must not parse: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_bisect_log_entries_from_every_git_version() {
+        for line in [
+            format!("# first bad commit: [{SHA}] introduce bug"),
+            format!("# first 'bad' commit: [{SHA}] introduce bug"),
+            format!("# first 'new' commit: [{SHA}] introduce bug"),
+        ] {
+            assert_eq!(
+                first_bad_from_log(&line).as_deref(),
+                Some(SHA),
+                "line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_bisect_log_lines_that_are_not_the_answer() {
+        for line in [
+            format!("# bad: [{SHA}] docs change"),
+            format!("# good: [{SHA}] rev1"),
+            format!("# possible first 'bad' commit: [{SHA}] rev1"),
+            "# first bad commit: [deadbee] introduce bug".to_string(),
+            String::new(),
+        ] {
+            assert!(
+                first_bad_from_log(&line).is_none(),
+                "must not parse: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_object_id_shape() {
+        assert!(is_full_oid(SHA));
+        assert!(is_full_oid(SHA256));
+        assert!(!is_full_oid(&SHA[..39]));
+        assert!(!is_full_oid(&SHA[..38]));
+        assert!(!is_full_oid(""));
+        assert!(!is_full_oid("7ca4e2bc068b86cc4b741933f77d0adf421e786z"));
+    }
 }
