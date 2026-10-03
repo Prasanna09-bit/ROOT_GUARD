@@ -1,0 +1,2 @@
+src/api/users.ts(44,13): error TS2304: Cannot find name 'Response'.
+src/api/users.ts(51,20): error TS2322: Type 'string' is not assignable to type 'number'.

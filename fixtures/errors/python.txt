@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/app/main.py", line 10, in <module>
+    run()
+  File "/app/svc.py", line 33, in run
+    raise ValueError("bad input")
+ValueError: bad input

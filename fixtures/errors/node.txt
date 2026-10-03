@@ -1,0 +1,4 @@
+TypeError: Cannot read properties of undefined (reading 'id')
+    at getUser (/app/src/user.js:21:18)
+    at processRequest (/app/src/index.js:5:1)
+    at /app/src/server.js:12:5

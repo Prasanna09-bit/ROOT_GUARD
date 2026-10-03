@@ -1,0 +1,5 @@
+error[E0425]: unresolved name `user_id`
+  --> src/db.rs:42:9
+   |
+42 |     let id = user_id;
+   |             ^^^^^^^^ not found in this scope
