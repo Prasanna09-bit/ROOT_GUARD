@@ -21,6 +21,10 @@ pub struct Report {
     pub verification: Option<Verification>,
     /// Generated regression guards (`check | fingerprint | cite`).
     pub guards: Vec<String>,
+    /// Prior sightings of this failure, decay applied (V3) — `None` unless
+    /// the failure memory was consulted (or disabled with `--no-memory`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::memory::Recall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +82,7 @@ impl Report {
             analysis: chain,
             verification: None,
             guards: vec![],
+            memory: None,
         }
     }
 
@@ -116,6 +121,10 @@ impl Report {
             o.push_str(&format!("symbol      : {s}\n"));
         }
         o.push('\n');
+        if let Some(m) = &self.memory {
+            o.push_str(&m.to_text());
+            o.push('\n');
+        }
 
         o.push_str("Failure chain (5 whys)\n");
         o.push_str(&"-".repeat(72));

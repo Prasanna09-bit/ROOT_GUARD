@@ -45,6 +45,12 @@ enum Cmd {
         /// Known-good ref for T3's mutation check (auto-detected when omitted; implies --verify)
         #[arg(long)]
         good: Option<String>,
+        /// Record a triage verdict for this failure (calibration input)
+        #[arg(long, value_enum)]
+        triage: Option<Triage>,
+        /// Skip the local failure memory entirely (no recall, no recording)
+        #[arg(long)]
+        no_memory: bool,
     },
 
     /// Run a command; on failure, analyze the captured error automatically
@@ -53,6 +59,19 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
         /// Repository root used for blame and symbol search
+        #[arg(long, short = 'r', default_value = ".")]
+        root: PathBuf,
+        /// Output format
+        #[arg(long, short = 'f', default_value_t = Format::Text)]
+        format: Format,
+        /// Skip the local failure memory entirely (no recall, no recording)
+        #[arg(long)]
+        no_memory: bool,
+    },
+
+    /// Report how well verification tiers predict human triage verdicts
+    Calibrate {
+        /// Repository root whose failure memory to read
         #[arg(long, short = 'r', default_value = ".")]
         root: PathBuf,
         /// Output format
@@ -86,6 +105,22 @@ enum Format {
     Yaml,
 }
 
+/// Human verdict on whether the analysis was right (`explain --triage`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Triage {
+    Correct,
+    Wrong,
+}
+
+impl From<Triage> for rootguard::memory::Verdict {
+    fn from(t: Triage) -> Self {
+        match t {
+            Triage::Correct => rootguard::memory::Verdict::Correct,
+            Triage::Wrong => rootguard::memory::Verdict::Wrong,
+        }
+    }
+}
+
 impl std::fmt::Display for Format {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -115,10 +150,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             verify,
             test,
             good,
+            triage,
+            no_memory,
         } => {
             let (raw, source) = resolve_input(input.as_deref())?;
+            if no_memory && triage.is_some() {
+                anyhow::bail!("--triage records into the failure memory; drop --no-memory");
+            }
             let do_verify = verify || test.is_some() || good.is_some();
-            let report = if do_verify {
+            let mut report = if do_verify {
                 let opts = rootguard::verify::Options {
                     test_cmd: test.as_deref(),
                     good: good.as_deref(),
@@ -127,6 +167,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 rootguard::analyze(&raw, &root, &source, None)
             };
+            if !no_memory {
+                // After the ladder: memory writes must never influence (or be
+                // cleaned up by) the verification runs.
+                match rootguard::memory::remember(&root, &report, triage.map(Into::into)) {
+                    Ok(recall) => report.memory = Some(recall),
+                    Err(e) => eprintln!("rootguard: failure memory: {e:#}"),
+                }
+            }
             emit(&report, format);
             Ok(ExitCode::SUCCESS)
         }
@@ -135,6 +183,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             command,
             root,
             format,
+            no_memory,
         } => {
             let result = runner::run_capture(&command, &root)?;
             if result.exit_code == 0 {
@@ -163,9 +212,28 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
             };
             let source = format!("watch:{label}");
-            let report = rootguard::analyze(&raw, &root, &source, Some(result.exit_code));
+            let mut report = rootguard::analyze(&raw, &root, &source, Some(result.exit_code));
+            if !no_memory {
+                match rootguard::memory::remember(&root, &report, None) {
+                    Ok(recall) => report.memory = Some(recall),
+                    Err(e) => eprintln!("rootguard: failure memory: {e:#}"),
+                }
+            }
             emit(&report, format);
             Ok(ExitCode::from(result.exit_code.clamp(1, 255) as u8))
+        }
+
+        Cmd::Calibrate { root, format } => {
+            let cal = rootguard::memory::calibrate(&root);
+            match format {
+                Format::Text => println!("{}", cal.to_text()),
+                Format::Yaml => println!(
+                    "{}",
+                    serde_yaml::to_string(&cal)
+                        .unwrap_or_else(|e| format!("# serialize error: {e}"))
+                ),
+            }
+            Ok(ExitCode::SUCCESS)
         }
 
         Cmd::Bisect {

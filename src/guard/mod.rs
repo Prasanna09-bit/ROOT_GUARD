@@ -53,7 +53,16 @@ pub fn generate(err: &NormalizedError, root: &Path) -> Vec<Guard> {
         cite: err
             .location
             .as_ref()
-            .map(|l| l.cite())
+            .map(|l| {
+                // Same portability rule as the check: a cite a machine cannot
+                // resolve outside this checkout is decoration, not evidence.
+                let file = crate::codeintel::relativize(root, &l.file);
+                match (l.line, l.column) {
+                    (Some(n), Some(c)) => format!("{file}:{n}:{c}"),
+                    (Some(n), None) => format!("{file}:{n}"),
+                    _ => file,
+                }
+            })
             .unwrap_or_else(|| format!("class {}", err.kind)),
     }]
 }

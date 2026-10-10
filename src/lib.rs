@@ -3,12 +3,15 @@
 //! V1 is deterministic: ingest → normalize → fingerprint → blame/scan
 //! → 5-why chain → report. V2 adds the verification ladder (T1 instance,
 //! T2 citations, T3 mutation-check), confidence tiers for class expansion,
-//! and regression-guard generation. No AI, no network, no database.
+//! and regression-guard generation. V3 adds failure memory: prior sightings
+//! recall, tier decay + revalidation, and triage calibration.
+//! No AI, no network, no database.
 
 pub mod codeintel;
 pub mod gitintel;
 pub mod guard;
 pub mod ingest;
+pub mod memory;
 pub mod normalize;
 pub mod reason;
 pub mod report;

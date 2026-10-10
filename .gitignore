@@ -1,1 +1,6 @@
 /target
+
+# RootGuard's own failure memory — local state, never user code. Ignoring it
+# keeps `git status` clean so report snapshots and T3's clean-tree checks see
+# the user's tree, not ours (and `git clean -qfd` can't remove it either).
+.rootguard/

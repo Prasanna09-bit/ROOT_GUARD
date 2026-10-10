@@ -48,6 +48,15 @@ impl Tier {
             Tier::Possible => 0,
         }
     }
+
+    /// Inverse of [`Tier::rank`] — decay arithmetic works on ranks.
+    pub fn from_rank(rank: u8) -> Tier {
+        match rank {
+            0 => Tier::Possible,
+            1 => Tier::Likely,
+            _ => Tier::Confirmed,
+        }
+    }
 }
 
 impl std::fmt::Display for Tier {
@@ -557,6 +566,14 @@ fn prevention(err: &NormalizedError) -> ChainStep {
 mod tests {
     use super::*;
     use crate::normalize::Location;
+
+    #[test]
+    fn tier_rank_round_trips() {
+        for tier in [Tier::Confirmed, Tier::Likely, Tier::Possible] {
+            assert_eq!(Tier::from_rank(tier.rank()), tier);
+        }
+        assert_eq!(Tier::from_rank(9), Tier::Confirmed, "clamps up");
+    }
 
     #[test]
     fn chain_has_five_levels() {
