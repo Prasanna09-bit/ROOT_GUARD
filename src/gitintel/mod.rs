@@ -90,6 +90,32 @@ pub fn blame_line(root: &Path, file: &str, line: u32) -> Option<BlameLine> {
     })
 }
 
+/// Commits that touched exactly `line` of `file`, newest first.
+///
+/// Unlike [`blame_line`] (which only reports the *last* author), this walks
+/// the line's full history: the last element is the commit that introduced
+/// the line. When the list has exactly one entry the current line content
+/// entered the codebase there and never changed since — the strongest
+/// attribution git can give. `--no-patch` keeps the output parseable;
+/// a missing file, untracked path or out-of-range line exits non-zero and
+/// yields an empty list (callers fall back to coarser evidence).
+pub fn line_history(root: &Path, file: &str, line: u32) -> Vec<Commit> {
+    let out = match git(
+        root,
+        &[
+            "log",
+            "-L",
+            &format!("{line},{line}:{file}"),
+            "--no-patch",
+            "--pretty=format:%H|%h|%an|%s|%aI",
+        ],
+    ) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    parse_commits(&out)
+}
+
 /// Recent commits touching `file` (fallback when line blame is unavailable).
 pub fn file_history(root: &Path, file: &str, limit: usize) -> Vec<Commit> {
     let out = match git(

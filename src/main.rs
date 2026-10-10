@@ -14,7 +14,10 @@ use rootguard::ingest::runner;
     long_about = "RootGuard turns a single failure into a cited root-cause chain, \
                   finds the commit that introduced it, and shows every site in the \
                   codebase that shares the failure class.\n\n\
-                  V1 is deterministic only — no AI, no network."
+                  `explain --verify` runs the T1/T2/T3 verification ladder: reproduce \
+                  the instance, resolve every citation, and mutation-check the \
+                  generated guard against a known-good revision.\n\n\
+                  Deterministic only — no AI, no network."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,6 +36,15 @@ enum Cmd {
         /// Output format
         #[arg(long, short = 'f', default_value_t = Format::Text)]
         format: Format,
+        /// Run the T1/T2/T3 verification ladder (executes check commands locally)
+        #[arg(long)]
+        verify: bool,
+        /// Command that reproduces the failure — enables T1 and T3 (implies --verify)
+        #[arg(long)]
+        test: Option<String>,
+        /// Known-good ref for T3's mutation check (auto-detected when omitted; implies --verify)
+        #[arg(long)]
+        good: Option<String>,
     },
 
     /// Run a command; on failure, analyze the captured error automatically
@@ -100,9 +112,21 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             input,
             root,
             format,
+            verify,
+            test,
+            good,
         } => {
             let (raw, source) = resolve_input(input.as_deref())?;
-            let report = rootguard::analyze(&raw, &root, &source, None);
+            let do_verify = verify || test.is_some() || good.is_some();
+            let report = if do_verify {
+                let opts = rootguard::verify::Options {
+                    test_cmd: test.as_deref(),
+                    good: good.as_deref(),
+                };
+                rootguard::analyze_verified(&raw, &root, &source, None, &opts)
+            } else {
+                rootguard::analyze(&raw, &root, &source, None)
+            };
             emit(&report, format);
             Ok(ExitCode::SUCCESS)
         }

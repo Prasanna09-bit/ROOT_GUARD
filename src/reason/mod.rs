@@ -13,6 +13,59 @@ pub enum Confidence {
     Hypothesis,
 }
 
+/// Confidence tier for a class-expansion candidate (suspect commit or site).
+///
+/// Independent of [`Confidence`], which grades *chain steps*: tiers grade how
+/// strongly the evidence ties a candidate to the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tier {
+    /// Git itself proves the attribution: the failing line entered the codebase
+    /// in this commit and never changed since — or the tool observed the error
+    /// at this site.
+    Confirmed,
+    /// Strong single signal: line-level blame (last author of the failing
+    /// line), or one commit touching several sites of the same class.
+    Likely,
+    /// Weak/co-located signal only: file history, sibling sites, whole-word
+    /// matches that could over-match.
+    Possible,
+}
+
+impl Tier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Tier::Confirmed => "confirmed",
+            Tier::Likely => "likely",
+            Tier::Possible => "possible",
+        }
+    }
+
+    pub fn rank(&self) -> u8 {
+        match self {
+            Tier::Confirmed => 2,
+            Tier::Likely => 1,
+            Tier::Possible => 0,
+        }
+    }
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tier::Confirmed => write!(f, "CONFIRMED"),
+            Tier::Likely => write!(f, "LIKELY"),
+            Tier::Possible => write!(f, "POSSIBLE"),
+        }
+    }
+}
+
+/// Old V1 reports predate tiers; missing fields deserialize as the weakest
+/// tier rather than failing the contract.
+fn tier_possible() -> Tier {
+    Tier::Possible
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evidence {
     /// `file:line:col`, `commit <sha>` or `symbol @ n sites`.
@@ -35,12 +88,16 @@ pub struct Suspect {
     pub author: String,
     pub summary: String,
     pub why: String,
+    #[serde(default = "tier_possible")]
+    pub tier: Tier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolSiteOut {
     pub file: String,
     pub line: u32,
+    #[serde(default = "tier_possible")]
+    pub tier: Tier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +150,12 @@ pub fn build(err: &NormalizedError, root: &std::path::Path) -> Chain {
     };
     // Real code first: "README.md:49" is a citation nobody can act on.
     sites.sort_by_key(|s| (docs_last(&s.file), s.file.clone(), s.line));
-    steps.push(systemic_cause(err, symbol.as_deref(), &sites));
+
+    // Class expansion: blame sibling sites of the same class so the suspect
+    // list covers commits that touched the pattern, not just the one line.
+    expand_suspects(err, root, &sites, &mut suspects);
+
+    steps.push(systemic_cause(err, symbol.as_deref(), &sites, root));
 
     // 5. Prevention — cheapest guard that covers this class.
     steps.push(prevention(err));
@@ -103,6 +165,7 @@ pub fn build(err: &NormalizedError, root: &std::path::Path) -> Chain {
         .map(|s| SymbolSiteOut {
             file: s.file.clone(),
             line: s.line,
+            tier: site_tier(err, s, root),
         })
         .collect();
 
@@ -110,6 +173,105 @@ pub fn build(err: &NormalizedError, root: &std::path::Path) -> Chain {
         steps,
         suspects,
         sites: sites_out,
+    }
+}
+
+/// Are these the same file, regardless of path form (absolute from a
+/// traceback, `./`-relative from a walk)?
+fn same_file(root: &std::path::Path, a: &str, b: &str) -> bool {
+    crate::codeintel::relativize(root, a) == crate::codeintel::relativize(root, b)
+}
+
+/// Tier of a site in the failure class, anchored to where the tool actually
+/// observed the error: the failing site is confirmed, the rest of its file is
+/// likely, other files are possible (whole-word search can over-match).
+fn site_tier(
+    err: &NormalizedError,
+    site: &crate::codeintel::SymbolSite,
+    root: &std::path::Path,
+) -> Tier {
+    let Some(loc) = err.location.as_ref() else {
+        return Tier::Possible;
+    };
+    if !same_file(root, &loc.file, &site.file) {
+        return Tier::Possible;
+    }
+    if loc.line == Some(site.line) {
+        Tier::Confirmed
+    } else {
+        Tier::Likely
+    }
+}
+
+/// Blame sibling sites of the class and add their authors as suspects.
+///
+/// A commit that last touched *several* sites of the same failure class is a
+/// systemic candidate (`likely`); a single-site touch is only `possible`.
+/// Deduplicates against the primary (failing-line) suspect and caps the list
+/// so a hot symbol can't turn the report into a git log.
+fn expand_suspects(
+    err: &NormalizedError,
+    root: &std::path::Path,
+    sites: &[crate::codeintel::SymbolSite],
+    suspects: &mut Vec<Suspect>,
+) {
+    const MAX_SIBLINGS: usize = 3;
+    const MAX_SUSPECTS: usize = 3;
+
+    if err.location.is_none() || suspects.len() >= MAX_SUSPECTS {
+        return;
+    }
+    let same_site = |s: &crate::codeintel::SymbolSite| {
+        err.location
+            .as_ref()
+            .is_some_and(|l| same_file(root, &l.file, &s.file) && Some(s.line) == l.line)
+    };
+
+    let mut blamed: Vec<(crate::codeintel::SymbolSite, gitintel::BlameLine)> = Vec::new();
+    for site in sites.iter().filter(|s| !same_site(s)) {
+        if blamed.len() >= MAX_SIBLINGS {
+            break;
+        }
+        if let Some(b) = gitintel::blame_line(root, &site.file, site.line) {
+            blamed.push((site.clone(), b));
+        }
+    }
+    if blamed.is_empty() {
+        return;
+    }
+
+    // Occurrences per commit across the primary suspect and the siblings.
+    let primary_sha = suspects.first().map(|s| s.commit.clone());
+    let count_of = |sha: &str| -> usize {
+        let primary = usize::from(primary_sha.as_deref() == Some(sha));
+        primary + blamed.iter().filter(|(_, b)| b.commit == sha).count()
+    };
+
+    let mut pushed: Vec<String> = suspects.iter().map(|s| s.commit.clone()).collect();
+    for (site, b) in &blamed {
+        if suspects.len() >= MAX_SUSPECTS {
+            break;
+        }
+        if pushed.contains(&b.commit) {
+            continue;
+        }
+        pushed.push(b.commit.clone());
+        let tier = if count_of(&b.commit) >= 2 {
+            Tier::Likely
+        } else {
+            Tier::Possible
+        };
+        suspects.push(Suspect {
+            commit: b.commit.clone(),
+            short: b.commit.chars().take(8).collect(),
+            author: b.author.clone(),
+            summary: b.summary.clone(),
+            why: format!(
+                "last author of sibling site {}:{} in the same failure class",
+                site.file, site.line
+            ),
+            tier,
+        });
     }
 }
 
@@ -174,12 +336,24 @@ fn underlying_cause(
         && let Some(b) = gitintel::blame_line(root, &loc.file, line)
     {
         let short: String = b.commit.chars().take(8).collect();
+        // Line-introduction history decides the tier: if exactly one commit
+        // ever touched this line (and it is the blamed one), the current line
+        // content entered there and never changed — git itself proves the
+        // attribution. More revisions means the behavior could date from any
+        // of them: blame stays the strongest candidate, not a certainty.
+        let hist = gitintel::line_history(root, &loc.file, line);
+        let tier = if hist.len() == 1 && hist[0].sha == b.commit {
+            Tier::Confirmed
+        } else {
+            Tier::Likely
+        };
         suspects.push(Suspect {
             commit: b.commit.clone(),
             short: short.clone(),
             author: b.author.clone(),
             summary: b.summary.clone(),
             why: "last author of the exact failing line".into(),
+            tier,
         });
         return ChainStep {
             level: "underlying-cause".into(),
@@ -210,6 +384,7 @@ fn underlying_cause(
             author: c.author.clone(),
             summary: c.summary.clone(),
             why: "most recent commit touching the failing file".into(),
+            tier: Tier::Possible,
         });
         return ChainStep {
             level: "underlying-cause".into(),
@@ -239,7 +414,12 @@ fn underlying_cause(
     }
 }
 
-fn systemic_cause(err: &NormalizedError, symbol: Option<&str>, sites: &[SymbolSite]) -> ChainStep {
+fn systemic_cause(
+    err: &NormalizedError,
+    symbol: Option<&str>,
+    sites: &[SymbolSite],
+    root: &std::path::Path,
+) -> ChainStep {
     let Some(sym) = symbol else {
         return ChainStep {
             level: "systemic-cause".into(),
@@ -284,7 +464,7 @@ fn systemic_cause(err: &NormalizedError, symbol: Option<&str>, sites: &[SymbolSi
     let same_site = |s: &SymbolSite| {
         err.location
             .as_ref()
-            .is_some_and(|l| s.file == l.file && Some(s.line) == l.line)
+            .is_some_and(|l| same_file(root, &l.file, &s.file) && Some(s.line) == l.line)
     };
     let others = sites.iter().filter(|s| !same_site(s)).count();
 
@@ -410,5 +590,68 @@ mod tests {
         assert!(!chain.steps[0].evidence.is_empty());
         // Prevention is always a hypothesis in V1 (we suggest, not verify).
         assert_eq!(chain.steps[4].confidence, Confidence::Hypothesis);
+    }
+
+    #[test]
+    fn site_tiers_anchor_to_the_observed_location() {
+        use crate::codeintel::SymbolSite;
+
+        let root = std::env::temp_dir();
+        let with_loc = NormalizedError {
+            kind: ErrorKind::Runtime,
+            message: "boom".into(),
+            symbol: Some("boom".into()),
+            location: Some(Location {
+                file: "app.py".into(),
+                line: Some(2),
+                column: None,
+            }),
+            frames: vec![],
+            parse_confident: true,
+        };
+        let site = |file: &str, line: u32| SymbolSite {
+            file: file.into(),
+            line,
+            text: String::new(),
+        };
+        assert_eq!(
+            site_tier(&with_loc, &site("app.py", 2), &root),
+            Tier::Confirmed
+        );
+        assert_eq!(
+            site_tier(&with_loc, &site("./app.py", 2), &root),
+            Tier::Confirmed
+        );
+        assert_eq!(
+            site_tier(&with_loc, &site("app.py", 9), &root),
+            Tier::Likely
+        );
+        assert_eq!(
+            site_tier(&with_loc, &site("other.py", 1), &root),
+            Tier::Possible
+        );
+
+        let no_loc = NormalizedError {
+            location: None,
+            ..with_loc.clone()
+        };
+        assert_eq!(
+            site_tier(&no_loc, &site("app.py", 2), &root),
+            Tier::Possible
+        );
+
+        // An absolute location (python traceback) anchors the same way.
+        let abs_loc = NormalizedError {
+            location: Some(Location {
+                file: root.join("app.py").to_string_lossy().into_owned(),
+                line: Some(2),
+                column: None,
+            }),
+            ..with_loc.clone()
+        };
+        assert_eq!(
+            site_tier(&abs_loc, &site("app.py", 2), &root),
+            Tier::Confirmed
+        );
     }
 }

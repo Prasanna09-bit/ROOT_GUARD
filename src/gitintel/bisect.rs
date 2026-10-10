@@ -300,7 +300,12 @@ fn ensure_clean(root: &Path) -> anyhow::Result<()> {
 ///
 /// Every candidate is *verified* by actually running the test there — a
 /// "good" endpoint we never checked is how bisect silently returns nonsense.
-fn detect_good(root: &Path, test_cmd: &str) -> anyhow::Result<String> {
+///
+/// Temporarily checks out each candidate (restoring HEAD every iteration),
+/// so callers must ensure the tree is clean first. `pub(crate)` for the
+/// verification ladder, which reuses this exact strategy for its T3
+/// counterfactual revision.
+pub(crate) fn detect_good(root: &Path, test_cmd: &str) -> anyhow::Result<String> {
     let head = capture(root, &["rev-parse", "HEAD"])?.trim().to_string();
 
     let mut candidates: Vec<String> = Vec::new();

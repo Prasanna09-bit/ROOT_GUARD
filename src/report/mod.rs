@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 use crate::gitintel::GitContext;
 use crate::normalize::NormalizedError;
 use crate::reason::Chain;
+use crate::verify::Verification;
 
 /// Schema version of the YAML report (bump on breaking changes).
+///
+/// V2 fills the fields V1 declared as placeholders (`verification`, `guards`,
+/// per-candidate `tier`); the shape is additive, so schema 1 still applies.
 pub const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,9 +17,9 @@ pub struct Report {
     pub observed: Observed,
     pub normalized: Normalized,
     pub analysis: Chain,
-    /// V2 fills this with t1/t2/t3 verification results.
-    pub verification: Option<serde_yaml::Value>,
-    /// V2 fills this with generated regression guards.
+    /// T1/T2/T3 verification results — `None` unless `--verify` ran.
+    pub verification: Option<Verification>,
+    /// Generated regression guards (`check | fingerprint | cite`).
     pub guards: Vec<String>,
 }
 
@@ -137,8 +141,12 @@ impl Report {
             o.push('\n');
             for s in &self.analysis.suspects {
                 o.push_str(&format!(
-                    "  {}  {}  {}\n      why: {}\n",
-                    s.short, s.author, s.summary, s.why
+                    "  {}  {:<9}  {}  {}\n      why: {}\n",
+                    s.short,
+                    s.tier.to_string(),
+                    s.author,
+                    s.summary,
+                    s.why
                 ));
             }
             o.push('\n');
@@ -152,7 +160,7 @@ impl Report {
             o.push_str(&"-".repeat(72));
             o.push('\n');
             for site in self.analysis.sites.iter().take(20) {
-                o.push_str(&format!("  {}:{}\n", site.file, site.line));
+                o.push_str(&format!("  {}:{}  [{}]\n", site.file, site.line, site.tier));
             }
             if self.analysis.sites.len() > 20 {
                 o.push_str(&format!(
@@ -163,15 +171,89 @@ impl Report {
             o.push('\n');
         }
 
-        o.push_str(&format!(
-            "verification : {}\nguards       : {} (V2)\n",
-            if self.verification.is_some() {
-                "present"
-            } else {
-                "not run (V2)"
-            },
-            self.guards.len()
-        ));
+        o.push_str(&self.ladder_text());
+        o
+    }
+
+    /// Verification ladder + guards block (V2).
+    fn ladder_text(&self) -> String {
+        let mut o = String::new();
+        match &self.verification {
+            None => {
+                o.push_str(
+                    "verification : not run (pass --verify to execute the T1/T2/T3 ladder)\n",
+                );
+            }
+            Some(v) => {
+                o.push_str("Verification ladder\n");
+                o.push_str(&"-".repeat(72));
+                o.push('\n');
+                match &v.t1_instance {
+                    Some(t) => {
+                        let state = if t.reproduced {
+                            "reproduced"
+                        } else {
+                            "NOT REPRODUCED"
+                        };
+                        let fp = if t.observed_fingerprint == t.expected_fingerprint {
+                            "match".to_string()
+                        } else {
+                            format!("{} vs {}", t.observed_fingerprint, t.expected_fingerprint)
+                        };
+                        o.push_str(&format!(
+                            "T1 instance  : {state} (exit {}, fingerprint {fp})\n",
+                            t.exit_code
+                        ));
+                    }
+                    None => o.push_str("T1 instance  : not run (no --test command)\n"),
+                }
+                let t2 = &v.t2_citations;
+                o.push_str(&format!(
+                    "T2 citations : {}/{} resolved\n",
+                    t2.resolved, t2.checked
+                ));
+                for cite in &t2.unresolved {
+                    o.push_str(&format!("               unresolved: {cite}\n"));
+                }
+                match &v.t3_mutation {
+                    Some(t) => {
+                        if t.mutation_checked {
+                            o.push_str(&format!(
+                                "T3 mutation  : `{}` fails at HEAD, passes at {} — guard verified\n",
+                                t.check,
+                                t.good.as_deref().unwrap_or("good")
+                            ));
+                        } else {
+                            let state = match (t.head_fails, t.good_passes) {
+                                (false, _) => "guard does not fail at HEAD",
+                                (true, Some(false)) => "guard also fails at the good ref",
+                                (true, None) => "no counterfactual run",
+                                (true, Some(true)) => "not mutation-checked",
+                            };
+                            o.push_str(&format!("T3 mutation  : {state}\n"));
+                        }
+                    }
+                    None => o.push_str("T3 mutation  : inconclusive (see notes)\n"),
+                }
+                for n in &v.notes {
+                    o.push_str(&format!("  note: {n}\n"));
+                }
+                o.push_str(&format!("overall tier : {}\n", v.tier));
+                o.push('\n');
+            }
+        }
+
+        if self.guards.is_empty() {
+            o.push_str("guards       : none generated\n");
+        } else {
+            o.push_str(&format!("Guards ({})\n", self.guards.len()));
+            o.push_str(&"-".repeat(72));
+            o.push('\n');
+            for g in &self.guards {
+                o.push_str(&format!("  {g}\n"));
+            }
+            o.push('\n');
+        }
         o
     }
 }

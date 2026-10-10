@@ -36,6 +36,38 @@ const CODE_EXT: &[&str] = &[
 /// match half the repository and produce useless noise.
 const MIN_SYMBOL_LEN: usize = 3;
 
+/// Express `file` relative to `root` when it lives inside it (resolving
+/// symlinks in both operands); otherwise return it unchanged.
+///
+/// The one comparison rule for "is this the same file?": tool output may
+/// report absolute paths (python tracebacks), repo walks may start from
+/// `.` or an absolute root — both sides go through here before comparing.
+pub fn relativize(root: &Path, file: &str) -> String {
+    let p = Path::new(file);
+    if p.is_absolute() {
+        if let Ok(root_c) = root.canonicalize()
+            && let Ok(rel) = p.strip_prefix(&root_c)
+        {
+            return rel.to_string_lossy().into_owned();
+        }
+        // macOS-style symlinked temp roots: canonicalize the file too
+        // (requires it to exist, hence a separate step).
+        if let Ok(root_c) = root.canonicalize()
+            && let Ok(p_c) = p.canonicalize()
+            && let Ok(rel) = p_c.strip_prefix(&root_c)
+        {
+            return rel.to_string_lossy().into_owned();
+        }
+        // Lexical fallback against the root as given (works for paths that
+        // do not exist yet, e.g. citations to generated files).
+        if let Ok(rel) = p.strip_prefix(root) {
+            return rel.to_string_lossy().into_owned();
+        }
+        return file.to_string();
+    }
+    file.trim_start_matches("./").to_string()
+}
+
 /// Find all occurrences of `symbol` as a whole word under `root`.
 ///
 /// Deterministic: pure regex + filesystem walk, no LSP required.
@@ -55,6 +87,14 @@ pub fn find_symbol(root: &Path, symbol: &str, max: usize) -> Vec<SymbolSite> {
 
     let mut hits: Vec<SymbolSite> = Vec::new();
     walk(root, &re, max, 0, &mut hits);
+    // Report sites relative to `root` so they compose with locations from
+    // tool output (which are usually cwd-relative), regardless of whether
+    // the caller passed ".", "repo" or an absolute path.
+    for s in &mut hits {
+        if let Ok(r) = Path::new(&s.file).strip_prefix(root) {
+            s.file = r.to_string_lossy().into_owned();
+        }
+    }
     hits.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     hits.truncate(max);
     hits
